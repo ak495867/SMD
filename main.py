@@ -9,21 +9,32 @@ import warnings
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
 
 warnings.filterwarnings('ignore')
 
 def get_market_data(tickers, start_date, end_date):
     data = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
     data = data.dropna(axis=1, how='all')
-    returns = data.pct_change().dropna()
-    vol = returns.rolling(21).std()
-    mom = returns.rolling(63).sum()
-    features = pd.concat([returns, vol, mom], axis=1).dropna()
-    features.columns = [f"{col}_{feat}" for col in data.columns for feat in ['ret', 'vol', 'mom']]
-    target = returns.shift(-1).dropna()
-    aligned_features = features.loc[target.index]
-    return aligned_features, target, data.columns.tolist()
+    
+    rets = data.pct_change()
+    vol = rets.rolling(21).std()
+    mom = rets.rolling(63).sum()
+    target = rets.shift(-1)
+    
+    dfs = []
+    for col in data.columns:
+        df = pd.DataFrame({
+            'date': rets.index,
+            'ticker': col,
+            'ret': rets[col].values,
+            'vol': vol[col].values,
+            'mom': mom[col].values,
+            'target': target[col].values
+        })
+        dfs.append(df)
+        
+    long_df = pd.concat(dfs).dropna().sort_values('date').reset_index(drop=True)
+    return long_df
 
 class SMDModel(nn.Module):
     def __init__(self, input_dim, latent_dim):
@@ -34,8 +45,7 @@ class SMDModel(nn.Module):
             nn.Linear(latent_dim * 2, latent_dim)
         )
         self.metric_net = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * (latent_dim + 1) // 2),
-            nn.Tanh()
+            nn.Linear(latent_dim, latent_dim * (latent_dim + 1) // 2)
         )
         self.head = nn.Sequential(
             nn.Linear(latent_dim + 2, 32),
@@ -63,8 +73,9 @@ class SMDModel(nn.Module):
         out = self.head(torch.cat([z_next, curvature.unsqueeze(1), signal.unsqueeze(1)], dim=1))
         return out, signal, curvature
 
-def run_walk_forward(features, target, train_size=252, test_size=63, gap=5, latent_dim=8):
-    n_samples = len(features)
+def run_walk_forward(long_df, train_days=504, test_days=63, gap_days=5, latent_dim=8):
+    unique_dates = long_df['date'].unique()
+    
     smd_returns = []
     ridge_returns = []
     rf_returns = []
@@ -73,40 +84,51 @@ def run_walk_forward(features, target, train_size=252, test_size=63, gap=5, late
     rf_ic = []
     curvature_history = []
     
-    for i in range(0, n_samples - train_size - gap - test_size + 1, test_size):
-        train_end = i + train_size
-        test_start = train_end + gap
-        test_end = test_start + test_size
+    current_date_idx = 0
+    n_dates = len(unique_dates)
+    
+    while current_date_idx + train_days + gap_days + test_days <= n_dates:
+        train_end_idx = current_date_idx + train_days
+        gap_end_idx = train_end_idx + gap_days
+        test_end_idx = gap_end_idx + test_days
         
-        X_train, y_train = features.iloc[i:train_end].values, target.iloc[i:train_end].values
-        X_test, y_test = features.iloc[test_start:test_end].values, target.iloc[test_start:test_end].values
+        train_dates = unique_dates[current_date_idx:train_end_idx]
+        test_dates = unique_dates[gap_end_idx:test_end_idx]
+        
+        train_df = long_df[long_df['date'].isin(train_dates)]
+        test_df = long_df[long_df['date'].isin(test_dates)]
+        
+        feature_cols = ['ret', 'vol', 'mom']
+        X_train = train_df[feature_cols].values
+        y_train = train_df['target'].values
+        
+        X_test = test_df[feature_cols].values
+        y_test = test_df['target'].values
         
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
         X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
-        y_train_t = torch.tensor(y_train, dtype=torch.float32)
+        y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
         X_test_t = torch.tensor(X_test_scaled, dtype=torch.float32)
-        y_test_t = torch.tensor(y_test, dtype=torch.float32)
+        y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
         
-        model = SMDModel(input_dim=X_train_t.shape[1], latent_dim=latent_dim)
+        model = SMDModel(input_dim=3, latent_dim=latent_dim)
         optimizer = optim.Adam(model.parameters(), lr=0.005)
         
         for epoch in range(50):
             model.train()
             optimizer.zero_grad()
             preds, _, _ = model(X_train_t)
-            loss = mean_squared_error(preds.detach().numpy(), y_train_t.numpy())
-            loss_tensor = nn.MSELoss()(preds, y_train_t)
-            loss_tensor.backward()
+            loss = nn.MSELoss()(preds, y_train_t)
+            loss.backward()
             optimizer.step()
             
         model.eval()
         with torch.no_grad():
             smd_preds, smd_signals, smd_curv = model(X_test_t)
             smd_preds = smd_preds.numpy().flatten()
-            smd_signals = smd_signals.numpy()
             smd_curv = smd_curv.numpy()
             
         curvature_history.extend(smd_curv)
@@ -130,6 +152,8 @@ def run_walk_forward(features, target, train_size=252, test_size=63, gap=5, late
         smd_ic.append(np.corrcoef(smd_preds, y_test.flatten())[0, 1])
         ridge_ic.append(np.corrcoef(ridge_preds, y_test.flatten())[0, 1])
         rf_ic.append(np.corrcoef(rf_preds, y_test.flatten())[0, 1])
+        
+        current_date_idx += test_days
 
     return (np.array(smd_returns), np.array(ridge_returns), np.array(rf_returns),
             np.array(smd_ic), np.array(ridge_ic), np.array(rf_ic), np.array(curvature_history))
@@ -151,16 +175,26 @@ if __name__ == '__main__':
         'CB', 'MMC', 'ICE', 'AIG', 'TRV', 'ALL', 'PGR', 'AFL', 'MET', 'PRU',
         'HIG', 'AMP', 'LNC', 'PFG', 'TMK', 'RGA', 'FAF', 'EG', 'WRB', 'CINF',
         'AFG', 'Y', 'RLI', 'KMPR', 'THG', 'SIGI', 'ACGL', 'ESGR', 'JRVR', 'PLMR',
-        'KNSL', 'UFCS', 'HRTG', 'MCY', 'ARGO', 'MPWR', 'ANSS', 'CDNS', 'SNPS', 'MCHP'
+        'KNSL', 'UFCS', 'HRTG', 'MCY', 'ARGO', 'MPWR', 'ANSS', 'CDNS', 'SNPS', 'MCHP',
+        'AMAT', 'LRCX', 'KLAC', 'ASML', 'TSM', 'MU', 'NXPI', 'MRVL', 'ADI', 'ON',
+        'INTC', 'CSCO', 'ORCL', 'SAP', 'SHOP', 'SQ', 'UBER', 'LYFT', 'ABNB', 'COIN',
+        'HOOD', 'RBLX', 'U', 'SNOW', 'NET', 'DDOG', 'CRWD', 'ZS', 'OKTA', 'PANW',
+        'FTNT', 'CYBR', 'SPLK', 'NOW', 'WDAY', 'VEEV', 'ZM', 'DOCU', 'TWLO', 'MDB',
+        'ESTC', 'CFLT', 'GTLB', 'S', 'BILL', 'PAYC', 'STNE', 'PAGS', 'NU', 'MELI',
+        'SE', 'GRAB', 'BABA', 'JD', 'PDD', 'BIDU', 'NIO', 'XPEV', 'LI', 'TME',
+        'BILI', 'IQ', 'VIPS', 'WB', 'NTES', 'YMM', 'TAL', 'EDU', 'GOTU', 'COE',
+        'TIGR', 'FUTU', 'HUYA', 'DOYU', 'MOMO', 'YY', 'KC', 'BZ', 'RLX', 'YQ',
+        'DUOL', 'GLOB', 'CPNG', 'DASH', 'RIVN', 'LCID', 'F', 'GM', 'TM', 'HMC',
+        'STLA', 'RACE', 'VWAGY', 'BMWYY', 'NSANY', 'HYMTF', 'KIMLF', 'SONY', 'NVO', 'ASML'
     ]
     
     print("Fetching real market data...")
-    features, target, assets = get_market_data(tickers, '2018-01-01', '2023-12-31')
-    print(f"Loaded {len(assets)} assets. Shape: {features.shape}")
+    long_df = get_market_data(tickers, '2018-01-01', '2023-12-31')
+    print(f"Loaded {long_df['ticker'].nunique()} assets. Total observations: {len(long_df)}")
     
     print("Running purged walk-forward validation...")
     smd_ret, ridge_ret, rf_ret, smd_ic, ridge_ic, rf_ic, curv_hist = run_walk_forward(
-        features, target, train_size=504, test_size=63, gap=5, latent_dim=8
+        long_df, train_days=504, test_days=63, gap_days=5, latent_dim=8
     )
     
     smd_cum = np.cumprod(1 + smd_ret * 0.01)
@@ -169,9 +203,9 @@ if __name__ == '__main__':
     
     fig, axes = plt.subplots(3, 1, figsize=(14, 18))
     
-    axes[0].plot(smd_cum, label='SMD (Statistical Manifold Dynamics)', linewidth=2)
-    axes[0].plot(ridge_cum, label='Ridge Regression Baseline', linewidth=2, linestyle='--')
-    axes[0].plot(rf_cum, label='Random Forest Baseline', linewidth=2, linestyle='-.')
+    axes[0].plot(smd_cum, label='SMD', linewidth=2)
+    axes[0].plot(ridge_cum, label='Ridge', linewidth=2, linestyle='--')
+    axes[0].plot(rf_cum, label='Random Forest', linewidth=2, linestyle='-.')
     axes[0].set_title('Cumulative Returns (Purged Walk-Forward)')
     axes[0].set_ylabel('Portfolio Value')
     axes[0].legend()
@@ -187,7 +221,7 @@ if __name__ == '__main__':
     axes[1].grid(True, alpha=0.3)
     
     axes[2].scatter(curv_hist, smd_ret, alpha=0.3, s=10)
-    axes[2].set_title('SMD Returns vs Latent Manifold Curvature (Log-Det)')
+    axes[2].set_title('SMD Returns vs Latent Manifold Curvature')
     axes[2].set_xlabel('Curvature Proxy (log-det of Fisher Metric)')
     axes[2].set_ylabel('Forward Return')
     axes[2].grid(True, alpha=0.3)
