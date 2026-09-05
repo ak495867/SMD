@@ -10,7 +10,7 @@ Research prototype. No transaction costs, slippage, execution modeling, or live 
 
 ## Contents
 
-- [`SMD-MATH.md`](./SMD-MATH.md) — full mathematical formulation, explained from first principles (Fisher Information Metric, natural gradient flow, the Riemannian SDE, the Geodesic Tension alpha signal, worked numeric example)
+- [`MATH.md`](./MATH.md) — full mathematical formulation, explained from first principles (Fisher Information Metric, natural gradient flow, the Riemannian SDE, the Geodesic Tension alpha signal, worked numeric example)
 
 ## Approach at a glance
 
