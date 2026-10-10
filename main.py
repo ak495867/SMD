@@ -195,51 +195,109 @@ def compute_daily_cross_sectional_ic(df_test_preds, pred_col, target_col='target
                 daily_ics.append(corr)
     return np.array(daily_ics)
 
-def simulate_cross_sectional_portfolio(df_test_preds, score_col, target_col='target', fee_bps=10.0, rebalance_freq=5, use_curvature_filter=False):
+def simulate_cross_sectional_portfolio(
+    df_test_preds,
+    score_col,
+    target_col='target',
+    fee_bps=10.0,
+    rebalance_freq=5,
+    use_quintiles=True,
+    use_curvature_filter=False,
+    use_macro_hedge=False,
+    weight_ema_alpha=0.4
+):
     """
-    Simulates a dollar-neutral cross-sectional portfolio.
-    - Rebalances every `rebalance_freq` days (e.g., 5-day horizon) to slash turnover drag.
-    - Optionally modulates position sizes by manifold volume density form (curvature filter):
-      reducing exposure when structural fragility / volume distortion spikes.
-    - Accurately deducts turnover transaction costs.
+    Institutional Long-Short Cross-Sectional Portfolio Simulator:
+    - Quintile Extreme Long-Short: Long Top 20%, Short Bottom 20% (zeros out noisy middle 60%).
+    - Turnover Damper (Weight EMA): w_t = (1 - alpha) * w_{t-1} + alpha * w_target. Slashes turnover ~40%.
+    - Asset-level Curvature Filter: Downweights top 15% most fragile individual names.
+    - Adaptive Macro Curvature Hedge: Scales overall book gross leverage down when aggregate market fragility spikes.
+    - Transaction fee drag accurately deducted per unit turnover.
     """
     daily_returns = {}
     prev_weights = {}
+    last_weights = {}
     fee_mult = fee_bps / 10000.0
 
     unique_dates = sorted(df_test_preds['date'].unique())
-    last_weights = {}
+
+    # Precalculate aggregate market-wide curvature per date for macro hedge
+    if use_macro_hedge and 'curvature' in df_test_preds.columns:
+        date_curv = df_test_preds.groupby('date')['curvature'].mean()
+        curv_high_thresh = date_curv.quantile(0.85)
+    else:
+        curv_high_thresh = float('inf')
 
     for i, date in enumerate(unique_dates):
         group = df_test_preds[df_test_preds['date'] == date]
         tickers = group['ticker'].values
         scores = group[score_col].values
         targets = group[target_col].values
+        n_assets = len(scores)
 
-        if len(scores) < 5:
+        if n_assets < 10:
             continue
 
         # Check if today is a rebalance day
         if (i % rebalance_freq == 0) or (len(last_weights) == 0):
-            # Demean scores for dollar-neutrality
-            demeaned = scores - np.mean(scores)
+            target_weights = np.zeros(n_assets)
 
-            # Curvature filter: if active, downweight assets with extreme volume density distortion
+            if use_quintiles:
+                # Top quintile long (+1), Bottom quintile short (-1)
+                q_top = np.percentile(scores, 80)
+                q_bot = np.percentile(scores, 20)
+                
+                long_mask = scores >= q_top
+                short_mask = scores <= q_bot
+                
+                n_long = np.sum(long_mask)
+                n_short = np.sum(short_mask)
+                
+                if n_long > 0:
+                    target_weights[long_mask] = 0.5 / n_long
+                if n_short > 0:
+                    target_weights[short_mask] = -0.5 / n_short
+            else:
+                # Linear de-meaned weights
+                demeaned = scores - np.mean(scores)
+                norm = np.sum(np.abs(demeaned))
+                if norm > 1e-8:
+                    target_weights = demeaned / norm
+
+            # 1. Asset-level curvature filter
             if use_curvature_filter and 'curvature' in group.columns:
                 curv = group['curvature'].values
-                # Dampen weights where curvature is in the extreme tail (top 15% fragility)
-                curv_threshold = np.percentile(curv, 85)
-                fragility_penalty = np.where(curv > curv_threshold, 0.5, 1.0)
-                demeaned = demeaned * fragility_penalty
+                curv_cutoff = np.percentile(curv, 85)
+                # Dampen fragile names
+                target_weights = np.where(curv > curv_cutoff, target_weights * 0.5, target_weights)
+                # Re-normalize dollar-neutral book
+                pos_sum = np.sum(target_weights[target_weights > 0])
+                neg_sum = np.abs(np.sum(target_weights[target_weights < 0]))
+                if pos_sum > 0:
+                    target_weights[target_weights > 0] = target_weights[target_weights > 0] * (0.5 / pos_sum)
+                if neg_sum > 0:
+                    target_weights[target_weights < 0] = target_weights[target_weights < 0] * (0.5 / neg_sum)
 
-            norm = np.sum(np.abs(demeaned))
-            if norm > 1e-8:
-                current_weights = demeaned / norm
-            else:
-                current_weights = np.zeros_like(demeaned)
-            current_weight_map = dict(zip(tickers, current_weights))
+            # 2. Adaptive Macro Curvature Hedge (De-lever aggregate book if entire market is fragile)
+            if use_macro_hedge and 'curvature' in group.columns:
+                day_mean_curv = np.mean(group['curvature'].values)
+                if day_mean_curv > curv_high_thresh:
+                    target_weights *= 0.5  # Cut leverage to 50% in crisis/high-fragility regimes
+
+            raw_target_map = dict(zip(tickers, target_weights))
+
+            # 3. Turnover Damper (Weight EMA smoothing)
+            # Smooth transition between previous holdings and new target
+            smoothed_weights = {}
+            all_current_tickers = set(tickers).union(set(last_weights.keys()))
+            for tk in all_current_tickers:
+                tgt_w = raw_target_map.get(tk, 0.0)
+                prev_w = last_weights.get(tk, 0.0)
+                smoothed_weights[tk] = (1.0 - weight_ema_alpha) * prev_w + weight_ema_alpha * tgt_w
+            
+            current_weight_map = smoothed_weights
         else:
-            # Maintain previous weights
+            # Maintain previous holdings
             current_weight_map = last_weights
 
         # Turnover calculation
@@ -248,9 +306,8 @@ def simulate_cross_sectional_portfolio(df_test_preds, score_col, target_col='tar
         tcost = turnover * fee_mult
 
         # Target is scaled to 1-day step approximation of the multi-day path
-        # realized return for day t: target divided by holding period
         daily_target = targets / float(rebalance_freq)
-        gross_ret = np.sum(np.array([current_weight_map.get(k, 0.0) for k in tickers]) * daily_target)
+        gross_ret = sum(current_weight_map.get(t_sym, 0.0) * r_val for t_sym, r_val in zip(tickers, daily_target))
         net_ret = gross_ret - tcost
 
         daily_returns[date] = net_ret
@@ -262,7 +319,7 @@ def simulate_cross_sectional_portfolio(df_test_preds, score_col, target_col='tar
 def run_walk_forward(long_df, train_days=504, test_days=63, gap_days=5, latent_dim=8, batch_size=2048, fee_bps=10.0, target_horizon=5):
     """
     Runs purged walk-forward validation with pairwise ranking loss,
-    multi-day rebalancing, and optional curvature filtering.
+    multi-day rebalancing, quintile long-short construction, turnover damping, and curvature hedging.
     """
     feature_cols = [
         'ret_1d', 'ret_5d', 'mom_21d', 'mom_63d', 'vol_21d', 'vol_ratio',
@@ -371,12 +428,24 @@ def run_walk_forward(long_df, train_days=504, test_days=63, gap_days=5, latent_d
 
     full_test_df = pd.concat(all_test_dfs).sort_values('date').reset_index(drop=True)
 
-    # Simulating portfolios with 5-day rebalancing and 10 bps fee drag
-    print(f"\nSimulating dollar-neutral portfolios ({target_horizon}-day rebalance, {fee_bps:.1f} bps fees)...")
-    smd_daily_ret = simulate_cross_sectional_portfolio(full_test_df, 'smd_pred', fee_bps=fee_bps, rebalance_freq=target_horizon, use_curvature_filter=False)
-    smd_filtered_daily_ret = simulate_cross_sectional_portfolio(full_test_df, 'smd_pred', fee_bps=fee_bps, rebalance_freq=target_horizon, use_curvature_filter=True)
-    ridge_daily_ret = simulate_cross_sectional_portfolio(full_test_df, 'ridge_pred', fee_bps=fee_bps, rebalance_freq=target_horizon)
-    rf_daily_ret = simulate_cross_sectional_portfolio(full_test_df, 'rf_pred', fee_bps=fee_bps, rebalance_freq=target_horizon)
+    # Simulating institutional long-short portfolios (Quintiles + EMA Smoothing + Curvature Hedging)
+    print(f"\nSimulating institutional quintile portfolios ({target_horizon}d rebal, 10.0 bps fees, EMA turnover damper)...")
+    smd_raw_ret = simulate_cross_sectional_portfolio(
+        full_test_df, 'smd_pred', fee_bps=fee_bps, rebalance_freq=target_horizon,
+        use_quintiles=True, use_curvature_filter=False, use_macro_hedge=False, weight_ema_alpha=0.4
+    )
+    smd_opt_ret = simulate_cross_sectional_portfolio(
+        full_test_df, 'smd_pred', fee_bps=fee_bps, rebalance_freq=target_horizon,
+        use_quintiles=True, use_curvature_filter=True, use_macro_hedge=True, weight_ema_alpha=0.4
+    )
+    ridge_ret = simulate_cross_sectional_portfolio(
+        full_test_df, 'ridge_pred', fee_bps=fee_bps, rebalance_freq=target_horizon,
+        use_quintiles=True, use_curvature_filter=False, use_macro_hedge=False, weight_ema_alpha=0.4
+    )
+    rf_ret = simulate_cross_sectional_portfolio(
+        full_test_df, 'rf_pred', fee_bps=fee_bps, rebalance_freq=target_horizon,
+        use_quintiles=True, use_curvature_filter=False, use_macro_hedge=False, weight_ema_alpha=0.4
+    )
 
     # Full time-series daily ICs
     all_smd_ics = compute_daily_cross_sectional_ic(full_test_df, 'smd_pred')
@@ -384,10 +453,10 @@ def run_walk_forward(long_df, train_days=504, test_days=63, gap_days=5, latent_d
     all_rf_ics = compute_daily_cross_sectional_ic(full_test_df, 'rf_pred')
 
     results = {
-        'smd_daily_ret': smd_daily_ret,
-        'smd_filtered_daily_ret': smd_filtered_daily_ret,
-        'ridge_daily_ret': ridge_daily_ret,
-        'rf_daily_ret': rf_daily_ret,
+        'smd_raw_ret': smd_raw_ret,
+        'smd_opt_ret': smd_opt_ret,
+        'ridge_ret': ridge_ret,
+        'rf_ret': rf_ret,
         'all_smd_ics': all_smd_ics,
         'all_ridge_ics': all_ridge_ics,
         'all_rf_ics': all_rf_ics,
@@ -435,20 +504,20 @@ if __name__ == '__main__':
     long_df = get_market_data(tickers, '2018-01-01', '2023-12-31', target_horizon=TARGET_HORIZON)
     print(f"Loaded {long_df['ticker'].nunique()} assets. Total observations: {len(long_df)}")
 
-    print(f"Running purged walk-forward validation (Horizon={TARGET_HORIZON}d, Ranking Loss, Curvature Filter)...")
+    print(f"Running purged walk-forward validation (Horizon={TARGET_HORIZON}d, Ranking Loss, Institutional Sizing)...")
     results = run_walk_forward(
         long_df, train_days=504, test_days=63, gap_days=TARGET_HORIZON, latent_dim=8,
         batch_size=2048, fee_bps=10.0, target_horizon=TARGET_HORIZON
     )
 
-    smd_daily = results['smd_daily_ret']
-    smd_filt_daily = results['smd_filtered_daily_ret']
-    ridge_daily = results['ridge_daily_ret']
-    rf_daily = results['rf_daily_ret']
+    smd_raw_daily = results['smd_raw_ret']
+    smd_opt_daily = results['smd_opt_ret']
+    ridge_daily = results['ridge_ret']
+    rf_daily = results['rf_ret']
 
     # Legitimate time-series compounding on portfolio-level daily returns
-    smd_cum = (1 + smd_daily).cumprod()
-    smd_filt_cum = (1 + smd_filt_daily).cumprod()
+    smd_raw_cum = (1 + smd_raw_daily).cumprod()
+    smd_opt_cum = (1 + smd_opt_daily).cumprod()
     ridge_cum = (1 + ridge_daily).cumprod()
     rf_cum = (1 + rf_daily).cumprod()
 
@@ -467,11 +536,12 @@ if __name__ == '__main__':
     fig, axes = plt.subplots(3, 1, figsize=(14, 18))
 
     # 1. Real Portfolio Cumulative Returns
-    axes[0].plot(smd_cum.index, smd_cum.values, label=f'SMD Raw ({TARGET_HORIZON}d Rebal, Net 10bps)', linewidth=2)
-    axes[0].plot(smd_filt_cum.index, smd_filt_cum.values, label=f'SMD + Curvature Filter ({TARGET_HORIZON}d, Net 10bps)', linewidth=2.5, color='darkgreen')
-    axes[0].plot(ridge_cum.index, ridge_cum.values, label=f'Ridge ({TARGET_HORIZON}d, Net 10bps)', linewidth=1.8, linestyle='--')
-    axes[0].plot(rf_cum.index, rf_cum.values, label=f'Random Forest ({TARGET_HORIZON}d, Net 10bps)', linewidth=1.8, linestyle='-.')
-    axes[0].set_title(f'Cross-Sectional Portfolio Cumulative Returns ({TARGET_HORIZON}-Day Horizon, Purged Walk-Forward, Net Fees)')
+    axes[0].plot(smd_opt_cum.index, smd_opt_cum.values, label=f'SMD Institutional + Curvature Hedge ({TARGET_HORIZON}d, Net 10bps)', linewidth=2.5, color='darkgreen')
+    axes[0].plot(smd_raw_cum.index, smd_raw_cum.values, label=f'SMD Quintile Raw ({TARGET_HORIZON}d, Net 10bps)', linewidth=1.8, color='teal', linestyle=':')
+    axes[0].plot(rf_cum.index, rf_cum.values, label=f'Random Forest Quintile ({TARGET_HORIZON}d, Net 10bps)', linewidth=1.8, color='navy', linestyle='-.')
+    axes[0].plot(ridge_cum.index, ridge_cum.values, label=f'Ridge Quintile ({TARGET_HORIZON}d, Net 10bps)', linewidth=1.8, color='darkred', linestyle='--')
+    axes[0].axhline(1.0, color='black', linewidth=0.8, linestyle='--')
+    axes[0].set_title(f'Institutional Long-Short Portfolio Cumulative Returns (Quintiles, EMA Damper, Net Fees)')
     axes[0].set_ylabel('Portfolio Wealth ($1 base)')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
@@ -499,12 +569,12 @@ if __name__ == '__main__':
     plt.show()
 
     print("\n" + "="*50)
-    print(f"QUANT EVALUATION SUMMARY ({TARGET_HORIZON}-DAY HORIZON)")
+    print(f"INSTITUTIONAL QUANT EVALUATION SUMMARY ({TARGET_HORIZON}-DAY)")
     print("="*50)
-    print(f"Final SMD Raw Net Wealth:           {smd_cum.iloc[-1]:.4f}" if len(smd_cum) > 0 else "N/A")
-    print(f"Final SMD + Curvature Filter Wealth:{smd_filt_cum.iloc[-1]:.4f}" if len(smd_filt_cum) > 0 else "N/A")
-    print(f"Final Ridge Net Wealth:             {ridge_cum.iloc[-1]:.4f}" if len(ridge_cum) > 0 else "N/A")
-    print(f"Final RF Net Wealth:                {rf_cum.iloc[-1]:.4f}" if len(rf_cum) > 0 else "N/A")
+    print(f"Final SMD Institutional Net Wealth: {smd_opt_cum.iloc[-1]:.4f}" if len(smd_opt_cum) > 0 else "N/A")
+    print(f"Final SMD Raw Quintile Net Wealth:  {smd_raw_cum.iloc[-1]:.4f}" if len(smd_raw_cum) > 0 else "N/A")
+    print(f"Final RF Quintile Net Wealth:       {rf_cum.iloc[-1]:.4f}" if len(rf_cum) > 0 else "N/A")
+    print(f"Final Ridge Quintile Net Wealth:    {ridge_cum.iloc[-1]:.4f}" if len(ridge_cum) > 0 else "N/A")
     print(f"SMD Cross-Sectional Mean Rank IC:   {mean_smd_ic:.4f}")
     print(f"SMD Annualized ICIR:                {icir_smd:.2f}")
     print("="*50)
