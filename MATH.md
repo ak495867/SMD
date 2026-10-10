@@ -164,17 +164,21 @@ $$
 X_t \xrightarrow{} \theta_t
 $$
 
-**2. The Metric Learner** — a separate small network outputs the metric tensor $g_\phi(\theta_t)$ at any given point. To guarantee it's mathematically valid (a metric must be symmetric and positive-definite — loosely, "never produce a negative squared distance"), the network outputs a **Cholesky decomposition** $L$ and sets:
+**2. The Metric Learner** — a separate small network outputs the metric tensor $g_\phi(\theta_t)$ at any given point. To guarantee it's mathematically valid (a metric must be symmetric and positive-definite — loosely, "never produce a negative squared distance"), the network outputs a **Cholesky decomposition** $L$ with strictly positive diagonal entries (enforced via $\text{softplus}(\cdot) > 0$) and sets:
 $$
-g = L L^T
+g = L L^T + \epsilon I
 $$
-**What a Cholesky decomposition is, intuitively:** for any valid metric matrix $g$, there's always some matrix $L$ (roughly a "square root" of $g$) such that multiplying $L$ by its own transpose reconstructs $g$ exactly. Having the network output $L$ instead of $g$ directly is just an engineering trick to guarantee the output is always a legitimate metric, no matter what the network produces.
+**What a Cholesky decomposition is, intuitively:** for any valid metric matrix $g$, there is a unique lower-triangular matrix $L$ with positive diagonal entries such that multiplying $L$ by its own transpose reconstructs $g$ exactly. Having the network output $L$ with constrained positive diagonals guarantees the metric tensor is non-singular and strictly positive-definite across the latent manifold.
 
-**3. The Dynamics Engine** — a Neural ODE / SDE solver (e.g. the `torchdiffeq` library) numerically integrates the RSDE from Section 3 forward in time to produce $\theta_{t+\Delta}$.
+**3. The Dynamics Engine & Geometric Proxy** — in full theory, the RSDE from Section 3 is integrated forward in time. In the empirical PyTorch prototype, natural gradient flow is discretized along a potential gradient step:
+$$
+\theta_{t+\Delta} = \theta_t - \eta \, g^{-1}(\theta_t)\nabla_\theta V(\theta_t)
+$$
+Furthermore, while exact scalar curvature $R(\theta)$ requires second-order spatial derivatives of the metric via Christoffel symbols, empirical implementations commonly use the **Riemannian volume density form** $\log(\det g) = 2 \sum_i \log L_{ii}$ as an efficient local metric distortion proxy.
 
 **4. The Head** — a final MLP combines the evolved state and the geometric features into the prediction:
 $$
-(\theta_{t+\Delta},\ R,\ v_t) \xrightarrow{\text{MLP}} \hat{Y}_t
+(\theta_{t+\Delta},\ \log\det g,\ v_t) \xrightarrow{\text{MLP}} \hat{Y}_t
 $$
 
 ---
